@@ -1,7 +1,7 @@
 // Service worker: makes Echo open instantly and work as an installed app on iOS and Android.
-// Only the app shell (HTML/CSS/JS/icons) is cached. API calls and music (R2, Internet Archive)
+// Only the app shell (HTML/CSS/JS/icons) is cached. Music (NAS, Internet Archive)
 // always go to the network, so nothing private is stored here.
-const CACHE = 'echo-shell-v1';
+const CACHE = 'echo-shell-v2';
 const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/store.js', '/id3.js', '/manifest.json',
   '/icons/icon-192.png', '/icons/icon-512.png', '/icons/apple-touch-icon.png'];
 
@@ -18,7 +18,7 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   const url = new URL(req.url);
-  if (req.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
+  if (req.method !== 'GET' || url.origin !== location.origin) return;
   // network first so a new deploy is picked up right away (no mix of old and new files);
   // the cache is the fallback when offline or on a dead connection
   const key = req.mode === 'navigate' ? '/index.html' : req;

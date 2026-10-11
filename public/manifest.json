@@ -1,7 +1,7 @@
 {
   "name": "Echo",
   "short_name": "Echo",
-  "description": "个人音乐播放器",
+  "description": "开源音乐播放器：本机音乐 + NAS",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

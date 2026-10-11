@@ -1,116 +1,62 @@
-// Echo data layer. Runs in the browser:
-// - music: audio files in a Cloudflare R2 bucket (under music/), plus Internet Archive
-// - state: playlists, likes, history, track index -> localStorage, synced to echo/data.json in the same bucket
-// The browser never holds R2 keys: /api/sign hands out short-lived signed links for single objects.
+// Echo data layer. Runs entirely in the browser, no account and no server of our own:
+// - local: audio files imported from this device, kept in IndexedDB
+// - nas: a Subsonic compatible server (Navidrome, Gonic, Airsonic…) the user points us at
+// - archive: free music from Internet Archive
+// Playlists, likes, history and the track index live in IndexedDB on this device.
 (function () {
-  const LS_KEY = 'echo.r2.v1';
-  const STATE_KEY = 'echo/data.json';
-  // data from the Google Drive / Blob versions is not carried over: start clean
-  try { localStorage.removeItem('echo.state.v2'); } catch {}
-  const MUSIC = 'music/';
-  const empty = () => ({ tracks: {}, likes: [], playlists: [], history: [], covers: {}, updatedAt: 0, at: {} });
-  // Each part of the state syncs on its own clock, so a change on one device (say, a new playlist on the phone)
-  // isn't overwritten by an unrelated change on another (say, the computer playing a song).
-  const SECTIONS = { playlists: ['playlists'], likes: ['likes'], history: ['history'], library: ['tracks', 'covers'] };
+  const DB_NAME = 'echo';
+  const NAS_KEY = 'echo.nas.v1';
+  const empty = () => ({ tracks: {}, likes: [], playlists: [], history: [], covers: {} });
 
   let S = empty();
-  let signedIn = false;
-  let me = null;
-  let pushTimer = null;
+  let nas = null; // { url, user, salt, token }
   const listeners = new Set();
+  const emit = () => listeners.forEach((f) => f(S));
 
-  // ---------- auth + signed links ----------
-  async function apiFetch(url, opts = {}) {
-    const r = await fetch(url, { credentials: 'same-origin', ...opts });
-    if (r.status === 401) { signedIn = false; throw new Error('signed_out'); }
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || `http_${r.status}`);
-    return j;
+  // ---------- IndexedDB: 'files' holds imported audio, 'kv' holds the library state ----------
+  let dbp = null;
+  function db() {
+    return (dbp ||= new Promise((resolve, reject) => {
+      const r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = () => { r.result.createObjectStore('files'); r.result.createObjectStore('kv'); };
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    }));
   }
-  const postJson = (url, body) => apiFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const urlCache = new Map(); // key -> { url, exp }
-  // fresh-enough GET links for many keys at once
-  async function signGet(keys, force = false) {
-    const now = Date.now();
-    const need = [...new Set(keys)].filter((k) => force || !(urlCache.get(k)?.exp > now + 60 * 60e3));
-    for (let i = 0; i < need.length; i += 500) {
-      const j = await postJson('/api/sign', { get: need.slice(i, i + 500) });
-      for (const [k, url] of Object.entries(j.urls)) urlCache.set(k, { url, exp: now + (j.ttl - 300) * 1000 });
-    }
-    return Object.fromEntries(keys.map((k) => [k, urlCache.get(k).url]));
+  async function idb(store, mode, fn) {
+    const d = await db();
+    return new Promise((resolve, reject) => {
+      const tx = d.transaction(store, mode);
+      const req = fn(tx.objectStore(store));
+      tx.oncomplete = () => resolve(req?.result);
+      tx.onerror = tx.onabort = () => reject(tx.error);
+    });
   }
-  const signOne = async (key, force) => (await signGet([key], force))[key];
-  const signPut = async (key) => (await postJson('/api/sign', { put: key })).url;
+  const idbGet = (store, key) => idb(store, 'readonly', (s) => s.get(key));
+  const idbPut = (store, key, val) => idb(store, 'readwrite', (s) => s.put(val, key));
+  const idbDel = (store, keys) => idb(store, 'readwrite', (s) => { for (const k of [].concat(keys)) s.delete(k); });
 
   // ---------- state persistence ----------
   function serialize() {
     const tracks = {};
-    for (const [id, t] of Object.entries(S.tracks)) tracks[id] = t.coverKey ? { ...t, cover: undefined } : t;
-    return JSON.stringify({ ...S, tracks });
+    // covers are rebuilt on load: data URLs live in S.covers once, NAS cover links carry the login token
+    for (const [id, t] of Object.entries(S.tracks)) tracks[id] = t.coverKey || t.coverArt ? { ...t, cover: undefined } : t;
+    return { ...S, tracks };
   }
   function hydrate(raw) {
     const s = { ...empty(), ...raw };
-    s.at = { ...s.at };
-    for (const sec of Object.keys(SECTIONS)) s.at[sec] ??= s.updatedAt || 0; // states saved before per-part clocks
-    for (const t of Object.values(s.tracks)) if (t.coverKey) t.cover = s.covers[t.coverKey] || null;
+    for (const t of Object.values(s.tracks)) {
+      if (t.coverKey) t.cover = s.covers[t.coverKey] || null;
+      else if (t.coverArt) t.cover = nasCover(t.coverArt);
+    }
     return s;
   }
-  function saveLocal() { try { localStorage.setItem(LS_KEY, serialize()); } catch (e) { console.warn('local save failed', e); } }
-  function changed(...sections) {
-    S.updatedAt = Date.now();
-    S.at ||= {};
-    for (const sec of sections) S.at[sec] = S.updatedAt;
-    saveLocal();
-    if (signedIn) { clearTimeout(pushTimer); pushTimer = setTimeout(push, 1500); }
-  }
-  // take every part the other devices changed more recently; report whether we hold newer parts
-  function merge(remote) {
-    const r = hydrate(remote);
-    const took = [];
-    let localNewer = false;
-    for (const [sec, keys] of Object.entries(SECTIONS)) {
-      const ra = r.at[sec] || 0, la = S.at?.[sec] || 0;
-      if (ra > la) { for (const k of keys) S[k] = r[k]; S.at[sec] = ra; took.push(sec); }
-      else if (la > ra) localNewer = true;
-    }
-    if (took.length) { saveLocal(); emit(); }
-    return { took, localNewer };
-  }
-  async function readRemote() {
-    const r = await fetch(await signOne(STATE_KEY), { cache: 'no-store' });
-    if (r.status === 404) return null;
-    if (!r.ok) throw new Error(`R2 ${r.status}`);
-    return r.json();
-  }
-  let pulling = null;
-  function pull() {
-    return (pulling ||= (async () => {
-      try {
-        const remote = await readRemote();
-        if (!remote) return push();
-        if (merge(remote).localNewer) await write();
-      } finally { pulling = null; }
-    })());
-  }
-  async function push() {
-    if (!signedIn) return;
-    try {
-      const remote = await readRemote();
-      if (remote) merge(remote);
-      await write();
-    } catch (e) { console.warn('sync failed', e); }
-  }
-  async function write() {
-    const r = await fetch(await signPut(STATE_KEY), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: serialize() });
-    if (!r.ok) throw new Error(`R2 save ${r.status}`);
-  }
-  // pick up changes made on other devices while this one stays open
-  const refresh = () => { if (signedIn && document.visibilityState === 'visible') pull().catch(() => {}); };
-  document.addEventListener('visibilitychange', refresh);
-  setInterval(refresh, 60e3);
-  const emit = () => listeners.forEach((f) => f(S));
+  let saveTimer = null;
+  const save = () => idbPut('kv', 'state', serialize()).catch((e) => console.warn('save failed', e));
+  function changed() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 400); }
+  addEventListener('pagehide', () => { if (saveTimer) { clearTimeout(saveTimer); save(); } });
 
-  // ---------- R2 library scan ----------
+  // ---------- helpers ----------
   const hash = (s) => { let h = 2166136261; for (const c of String(s)) { h ^= c.codePointAt(0); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
   async function pool(items, n, fn) {
     let i = 0;
@@ -127,167 +73,226 @@
       return c.toDataURL('image/jpeg', 0.82);
     } catch { return null; }
   }
-  const trackId = (key) => 'r_' + encodeURIComponent(key);
-  async function readHead(key, size, bytes) {
-    const want = Math.max(1, Math.min(bytes, size || bytes));
-    const r = await fetch(await signOne(key), { headers: { Range: `bytes=0-${want - 1}` } });
-    if (!r.ok) throw new Error(`R2 ${r.status}`);
-    return new Uint8Array(await r.arrayBuffer());
+  const AUDIO = /\.(mp3|m4a|aac|flac|wav|ogg|opus)$/i;
+  const isAudio = (f) => /^audio\//.test(f.type) || AUDIO.test(f.name);
+  // a folder becomes a playlist; songs already in it stay where the user put them
+  function folderPlaylist(source, name, ids, description) {
+    let p = S.playlists.find((x) => x.source === source);
+    if (!p) { p = { id: 'f_' + hash(source), name, description, items: [], createdAt: Date.now(), source }; S.playlists.push(p); }
+    const have = new Set(p.items.map((i) => i.id));
+    for (const id of ids) if (!have.has(id)) { p.items.push({ id, at: Date.now(), auto: true }); have.add(id); }
+    return p;
   }
-  async function indexObject(o, previous) {
-    const rel = o.key.slice(MUSIC.length);
-    const parts = rel.split('/').filter(Boolean);
-    const filename = parts[parts.length - 1] || '未知歌曲';
-    const folder = parts.length > 1 ? parts[parts.length - 2] : null;
-    const base = filename.replace(/\.[^.]+$/, '') || filename;
-    const [fArtist, fTitle] = base.includes(' - ') ? base.split(' - ', 2) : [null, base.replace(/^\d+[\s.\-_]+/, '')];
-    let tags = {};
+
+  // ---------- local files ----------
+  async function readFileTags(file) {
     try {
-      let head = await readHead(o.key, o.size, 512 * 1024);
-      tags = readTags(head, o.size) || {};
-      if (tags.needBytes) {
-        tags = tags.needBytes <= 8 * 1024 * 1024 ? readTags(await readHead(o.key, o.size, tags.needBytes), o.size) || {} : {};
-        if (tags.needBytes) tags = {};
+      let tags = readTags(new Uint8Array(await file.slice(0, 512 * 1024).arrayBuffer()), file.size) || {};
+      if (tags.needBytes) tags = tags.needBytes <= 8 * 1024 * 1024 ? readTags(new Uint8Array(await file.slice(0, tags.needBytes).arrayBuffer()), file.size) || {} : {};
+      return tags.needBytes ? {} : tags;
+    } catch (e) { console.warn('tag read failed', file.name, e); return {}; }
+  }
+  // files: File[]; folder: playlist name for all of them, otherwise each file's own folder (folder picker) is used
+  async function importFiles(files, { folder = '', onProgress = () => {} } = {}) {
+    files = files.filter(isAudio);
+    if (!files.length) return { added: 0, skipped: 0 };
+    navigator.storage?.persist?.().catch(() => {}); // ask the browser not to clear our storage when space runs low
+    let added = 0, skipped = 0, done = 0;
+    const byFolder = new Map();
+    await pool(files, 2, async (file) => {
+      const id = 'l_' + hash(file.name) + hash(`${file.size}:${file.lastModified}`);
+      const parts = (file.webkitRelativePath || '').split('/').filter(Boolean);
+      const dir = folder.trim() || (parts.length > 1 ? parts[parts.length - 2] : '');
+      if (dir) { if (!byFolder.has(dir)) byFolder.set(dir, []); byFolder.get(dir).push(id); }
+      if (S.tracks[id]) { skipped++; onProgress(++done, files.length); return; }
+      await idbPut('files', id, file);
+      const tags = await readFileTags(file);
+      const base = file.name.replace(/\.[^.]+$/, '') || file.name;
+      const [fArtist, fTitle] = base.includes(' - ') ? base.split(' - ', 2) : [null, base.replace(/^\d+[\s.\-_]+/, '')];
+      const artist = tags.artist || tags.albumArtist || fArtist || '未知艺人';
+      const album = tags.album || dir || '单曲';
+      let coverKey = null;
+      if (tags.pic) {
+        coverKey = 'c' + hash(`${tags.albumArtist || artist}\u0000${album}`);
+        if (!S.covers[coverKey]) S.covers[coverKey] = await coverDataUrl(tags.pic);
+        if (!S.covers[coverKey]) coverKey = null;
       }
-    } catch (e) { if (e.message === 'signed_out') throw e; console.warn('tag read failed', o.key, e); }
-    const artist = tags.artist || tags.albumArtist || fArtist || '未知艺人';
-    const album = tags.album || folder || '单曲';
-    const albumArtist = tags.albumArtist || null;
-    let coverKey = null;
-    if (tags.pic) {
-      coverKey = 'c' + hash(`${albumArtist || artist}\u0000${album}`);
-      if (!S.covers[coverKey]) S.covers[coverKey] = await coverDataUrl(tags.pic);
-      if (!S.covers[coverKey]) coverKey = null;
+      S.tracks[id] = {
+        id, source: 'local', fileName: file.name, size: file.size, type: file.type || 'audio/mpeg',
+        title: tags.title || fTitle || base, artist, albumArtist: tags.albumArtist || null, album,
+        year: tags.year || null, trackNo: tags.track || null, genre: tags.genre || null, duration: tags.duration || 0,
+        coverKey, cover: coverKey ? S.covers[coverKey] : null, addedAt: Date.now(),
+      };
+      added++;
+      onProgress(++done, files.length);
+      if (added % 10 === 0) { changed(); emit(); }
+    });
+    for (const [dir, ids] of byFolder) folderPlaylist('local:' + dir, dir, ids, '从本机文件夹导入');
+    changed(); emit();
+    return { added, skipped };
+  }
+  // forget songs everywhere: library, playlists, likes, history (and the stored file for local ones)
+  function dropTracks(ids) {
+    const gone = new Set(ids);
+    for (const id of gone) delete S.tracks[id];
+    S.likes = S.likes.filter((l) => !gone.has(l.id));
+    S.history = S.history.filter((h) => !gone.has(h.id));
+    for (const p of S.playlists) p.items = p.items.filter((i) => !gone.has(i.id));
+    const used = new Set(Object.values(S.tracks).map((t) => t.coverKey).filter(Boolean));
+    for (const k of Object.keys(S.covers)) if (!used.has(k)) delete S.covers[k];
+  }
+  async function deleteLocal(ids) {
+    ids = ids.filter((id) => S.tracks[id]?.source === 'local');
+    await idbDel('files', ids);
+    dropTracks(ids);
+    S.playlists = S.playlists.filter((p) => !String(p.source || '').startsWith('local:') || p.items.length);
+    changed(); emit();
+    return ids.length;
+  }
+  async function localFile(id) {
+    const f = await idbGet('files', id);
+    if (!f) throw new Error('local_missing');
+    return f;
+  }
+  async function storageInfo() {
+    const est = await navigator.storage?.estimate?.().catch(() => null);
+    const persisted = await navigator.storage?.persisted?.().catch(() => false);
+    const local = Object.values(S.tracks).filter((t) => t.source === 'local');
+    return { used: est?.usage || local.reduce((a, t) => a + (t.size || 0), 0), quota: est?.quota || 0, persisted: !!persisted, count: local.length };
+  }
+
+  // ---------- NAS (Subsonic API) ----------
+  // token auth: we keep md5(password + salt) and the salt, never the password itself
+  function md5(str) {
+    const bytes = new TextEncoder().encode(str), n = bytes.length;
+    const words = new Uint32Array((((n + 8) >> 6) + 1) * 16);
+    for (let i = 0; i < n; i++) words[i >> 2] |= bytes[i] << ((i % 4) * 8);
+    words[n >> 2] |= 0x80 << ((n % 4) * 8);
+    words[words.length - 2] = n * 8;
+    const R = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+    const K = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 2 ** 32) >>> 0);
+    let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    for (let o = 0; o < words.length; o += 16) {
+      let A = a0, B = b0, C = c0, D = d0;
+      for (let i = 0; i < 64; i++) {
+        const r = i >> 4;
+        const F = r === 0 ? (B & C) | (~B & D) : r === 1 ? (D & B) | (~D & C) : r === 2 ? B ^ C ^ D : C ^ (B | ~D);
+        const g = r === 0 ? i : r === 1 ? (5 * i + 1) % 16 : r === 2 ? (3 * i + 5) % 16 : (7 * i) % 16;
+        const s = R[r * 4 + (i % 4)];
+        const f = (F + A + K[i] + words[o + g]) >>> 0;
+        A = D; D = C; C = B;
+        B = (B + ((f << s) | (f >>> (32 - s)))) >>> 0;
+      }
+      a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
     }
-    const id = trackId(o.key);
+    return [a0, b0, c0, d0].map((x) => [0, 8, 16, 24].map((b) => ((x >>> b) & 255).toString(16).padStart(2, '0')).join('')).join('');
+  }
+  const nasParams = (c = nas, extra = {}) => new URLSearchParams({ u: c.user, t: c.token, s: c.salt, v: '1.16.1', c: 'echo', f: 'json', ...extra });
+  const nasUrl = (method, extra, c = nas) => `${c.url}/rest/${method}.view?${nasParams(c, extra)}`;
+  function nasCover(coverArt) { return nas && coverArt ? nasUrl('getCoverArt', { id: coverArt, size: 300 }) : null; }
+  async function nasCall(method, extra = {}, c = nas) {
+    let r;
+    try { r = await fetch(nasUrl(method, extra, c)); } catch { throw new Error('nas_unreachable'); }
+    const j = await r.json().catch(() => null);
+    const res = j?.['subsonic-response'];
+    if (!res) throw new Error(r.ok ? 'nas_not_subsonic' : `nas_http_${r.status}`);
+    if (res.status !== 'ok') throw new Error(res.error?.code === 40 ? 'nas_wrong_login' : res.error?.code === 41 ? 'nas_token_unsupported' : `nas_error: ${res.error?.message || res.error?.code}`);
+    return res;
+  }
+  function normalizeUrl(u) {
+    u = String(u || '').trim().replace(/\/+$/, '').replace(/\/rest$/, '');
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    const url = new URL(u);
+    // an https page can't load http addresses (browsers block it); localhost is the one exception
+    if (location.protocol === 'https:' && url.protocol === 'http:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname)) throw new Error('nas_needs_https');
+    return u;
+  }
+  async function nasConnect({ url, user, password }) {
+    const salt = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+    const c = { url: normalizeUrl(url), user: String(user).trim(), salt, token: md5(String(password) + salt) };
+    await nasCall('ping', {}, c);
+    nas = c;
+    try { localStorage.setItem(NAS_KEY, JSON.stringify(nas)); } catch {}
+    return nasSync();
+  }
+  function nasDisconnect() {
+    nas = null;
+    try { localStorage.removeItem(NAS_KEY); } catch {}
+    dropTracks(Object.keys(S.tracks).filter((id) => S.tracks[id].source === 'nas'));
+    S.playlists = S.playlists.filter((p) => !String(p.source || '').startsWith('nas:'));
+    changed(); emit();
+  }
+  const nasTrackId = (songId) => 'n_' + encodeURIComponent(songId);
+  function nasTrack(s, previous) {
+    const id = nasTrackId(s.id);
     return {
-      id, source: 'r2', key: o.key, etag: o.etag, size: o.size,
-      title: tags.title || fTitle || base, artist, albumArtist, album,
-      year: tags.year || null, trackNo: tags.track || null, genre: tags.genre || null,
-      duration: tags.duration || previous?.duration || 0,
-      coverKey, cover: coverKey ? S.covers[coverKey] : null,
-      addedAt: previous?.addedAt || Date.parse(o.lastModified) || Date.now(),
+      id, source: 'nas', nasId: s.id, title: s.title || '未知歌曲', artist: s.artist || '未知艺人',
+      albumArtist: s.displayAlbumArtist || s.albumArtists?.[0]?.name || null, album: s.album || '单曲',
+      year: s.year || null, trackNo: s.track || null, genre: s.genre || null, duration: s.duration || 0, size: s.size || 0,
+      coverArt: s.coverArt || null, cover: nasCover(s.coverArt), addedAt: previous?.addedAt || Date.parse(s.created) || Date.now(),
     };
   }
-  // each top-level folder under music/ is a playlist that follows the folder.
-  // Songs added by hand stay; songs that left the folder drop out.
-  function syncFolderPlaylists(byFolder) {
-    S.playlists = S.playlists.filter((p) => !String(p.source || '').startsWith('r2:') || byFolder.has(p.source.slice(3)));
-    const order = (a, b) => (S.tracks[a].album || '').localeCompare(S.tracks[b].album || '') || (S.tracks[a].trackNo ?? 999) - (S.tracks[b].trackNo ?? 999) || (S.tracks[a].title || '').localeCompare(S.tracks[b].title || '');
-    for (const [folder, ids] of byFolder) {
-      const source = 'r2:' + folder;
-      let p = S.playlists.find((x) => x.source === source);
-      if (!p) {
-        p = { id: 'f_' + hash(source), name: folder, description: '来自云端文件夹，文件夹里的歌有变动会自动更新', items: [], createdAt: Date.now(), source };
-        S.playlists.push(p);
-      }
-      const wanted = new Set(ids);
-      p.items = p.items.filter((i) => !i.auto || wanted.has(i.id));
-      const have = new Set(p.items.map((i) => i.id));
-      for (const id of ids.sort(order)) if (!have.has(id)) p.items.push({ id, at: Date.now(), auto: true });
-    }
-  }
-  let scanning = null;
-  function scan(onProgress = () => {}) {
-    if (!signedIn) return Promise.resolve({ total: 0, added: 0, removed: 0 });
-    return (scanning ||= (async () => {
+  const NAS_MAX = 30000;
+  let syncing = null;
+  function nasSync(onProgress = () => {}) {
+    if (!nas) return Promise.resolve(null);
+    return (syncing ||= (async () => {
       try {
-        onProgress({ phase: 'list', found: 0 });
-        const { items } = await apiFetch('/api/library');
-        onProgress({ phase: 'list', found: items.length });
         const seen = new Set();
-        const byFolder = new Map();
-        const before = JSON.stringify(S.playlists);
-        const todo = [];
-        for (const o of items) {
-          const id = trackId(o.key);
-          seen.add(id);
-          if (S.tracks[id]?.etag !== o.etag) todo.push(o);
-          const parts = o.key.slice(MUSIC.length).split('/').filter(Boolean);
-          if (parts.length > 1) { if (!byFolder.has(parts[0])) byFolder.set(parts[0], []); byFolder.get(parts[0]).push(id); }
+        const keep = (s) => { const id = nasTrackId(s.id); seen.add(id); S.tracks[id] = nasTrack(s, S.tracks[id]); return id; };
+        // every song (an empty search lists the whole library on Navidrome and most other servers)
+        for (let offset = 0; offset < NAS_MAX; offset += 500) {
+          const res = await nasCall('search3', { query: '', songCount: 500, songOffset: offset, artistCount: 0, albumCount: 0 });
+          const songs = res.searchResult3?.song || [];
+          songs.forEach(keep);
+          onProgress({ phase: 'songs', count: seen.size });
+          if (songs.length < 500) break;
         }
-        let done = 0;
-        await pool(todo, 4, async (o) => {
-          const id = trackId(o.key);
-          S.tracks[id] = await indexObject(o, S.tracks[id]);
-          onProgress({ phase: 'index', done: ++done, total: todo.length });
-          if (done % 10 === 0) { changed('library'); emit(); }
-        });
-        let removed = 0;
-        for (const [id, t] of Object.entries(S.tracks)) if (t.source === 'r2' && !seen.has(id)) { delete S.tracks[id]; removed++; }
-        syncFolderPlaylists(byFolder);
-        const used = new Set(Object.values(S.tracks).map((t) => t.coverKey).filter(Boolean));
-        for (const k of Object.keys(S.covers)) if (!used.has(k)) delete S.covers[k];
-        const sections = [];
-        if (todo.length || removed) sections.push('library');
-        if (JSON.stringify(S.playlists) !== before) sections.push('playlists');
-        if (sections.length) changed(...sections);
-        emit();
-        return { total: items.length, added: todo.length, removed };
-      } finally { scanning = null; }
+        // the server's playlists, mirrored; songs added here by hand stay
+        const { playlists } = await nasCall('getPlaylists');
+        const lists = playlists?.playlist || [];
+        const wanted = new Set();
+        let i = 0;
+        for (const pl of lists) {
+          const { playlist } = await nasCall('getPlaylist', { id: pl.id });
+          const ids = (playlist.entry || []).map(keep);
+          const source = 'nas:' + pl.id;
+          wanted.add(source);
+          const p = folderPlaylist(source, pl.name, [], 'NAS 上的歌单，每次同步会自动更新');
+          p.name = pl.name;
+          if (pl.comment) p.description = pl.comment;
+          const set = new Set(ids);
+          p.items = [...ids.map((id) => p.items.find((x) => x.id === id && x.auto) || { id, at: Date.now(), auto: true }), ...p.items.filter((x) => !x.auto && !set.has(x.id))];
+          onProgress({ phase: 'playlists', done: ++i, total: lists.length });
+        }
+        S.playlists = S.playlists.filter((p) => !String(p.source || '').startsWith('nas:') || wanted.has(p.source));
+        const removed = Object.keys(S.tracks).filter((id) => S.tracks[id].source === 'nas' && !seen.has(id));
+        dropTracks(removed);
+        changed(); emit();
+        return { songs: seen.size, playlists: lists.length, removed: removed.length };
+      } finally { syncing = null; }
     })());
   }
 
-  // ---------- upload ----------
-  const cleanName = (s) => String(s).replace(/[\\/\u0000-\u001f]/g, '_').replace(/^\.+/, '').trim().slice(0, 200);
-  function uploadOne(file, url, onBytes) {
-    return new Promise((resolve, reject) => {
-      const x = new XMLHttpRequest();
-      x.open('PUT', url);
-      x.setRequestHeader('Content-Type', file.type || 'audio/mpeg');
-      x.upload.onprogress = (e) => onBytes(e.loaded);
-      x.onload = () => (x.status < 300 ? resolve() : reject(new Error(`upload ${x.status}`)));
-      x.onerror = () => reject(new Error('network'));
-      x.send(file);
-    });
-  }
-  // folder (optional) becomes music/<folder>/..., which also makes it a playlist
-  async function upload(files, onProgress, folder = '') {
-    const dir = cleanName(folder);
-    const total = files.reduce((a, f) => a + f.size, 0) || 1;
-    let base = 0, ok = 0;
-    for (const f of files) {
-      const key = MUSIC + (dir ? dir + '/' : '') + cleanName(f.name);
-      await uploadOne(f, await signPut(key), (b) => onProgress((base + b) / total));
-      base += f.size; ok++;
-    }
-    await scan();
-    return { uploaded: ok };
-  }
-  // copy the songs from the old Vercel Blob store, a batch per call
-  async function migrateBlob(onProgress) {
-    let copied = 0;
-    const failed = new Set();
-    for (let round = 0; round < 200; round++) {
-      const r = await postJson('/api/migrate', {});
-      if (r.noBlob) return { total: 0, copied: 0, failed: [], noBlob: true };
-      copied += r.copied;
-      (r.failed || []).forEach((f) => failed.add(f));
-      onProgress({ copied, total: r.total, remaining: r.remaining });
-      if (r.done || (!r.copied && r.remaining === 0) || (!r.copied && r.failed?.length)) {
-        await scan();
-        return { total: r.total, copied, failed: [...failed] };
-      }
-    }
-    throw new Error('migrate_timeout');
-  }
-
   // ---------- playback source ----------
-  // 'stream': a signed link the audio element streams with range requests
-  // 'fresh': the same with a newly signed link (after a playback error); 'blob': download the whole file
-  async function src(t, mode = 'stream') {
-    if (t.source !== 'r2') return t.url;
-    if (mode !== 'blob') return signOne(t.key, mode === 'fresh');
-    const r = await fetch(await signOne(t.key, true));
-    if (!r.ok) throw new Error(`R2 ${r.status}`);
-    return URL.createObjectURL(await r.blob());
+  const objectUrls = new Map(); // local track id -> blob: URL (kept while the page lives)
+  async function src(t) {
+    if (t.source === 'local') {
+      if (!objectUrls.has(t.id)) objectUrls.set(t.id, URL.createObjectURL(await localFile(t.id)));
+      return objectUrls.get(t.id);
+    }
+    if (t.source === 'nas') {
+      if (!nas) throw new Error('nas_disconnected');
+      return nasUrl('stream', { id: t.nasId });
+    }
+    return t.url;
   }
-
-  // whole file into memory (for buffering the next song); null when too big to be worth it
+  // whole file into memory (for buffering the next song); null when there is nothing to gain
   const BUFFER_MAX = 80 * 1024 * 1024;
   async function download(t, signal) {
-    if (t.source === 'r2' && t.size > BUFFER_MAX) return null;
-    const r = await fetch(t.source === 'r2' ? await signOne(t.key) : t.url, { signal });
+    if (t.source === 'local') return null; // already on the device
+    if (t.size > BUFFER_MAX) return null;
+    const r = await fetch(await src(t), { signal });
     if (!r.ok) throw new Error(`download ${r.status}`);
     return URL.createObjectURL(await r.blob());
   }
@@ -326,32 +331,31 @@
     const parts = u.pathname.split('/').filter(Boolean).slice(1).map(decodeURIComponent); // drop "api"
     const [a, b, c] = parts;
     if (a === 'state') return S;
-    if (a === 'history') { S.history = [{ id: b, at: Date.now() }, ...S.history.filter((h) => h.id !== b)].slice(0, 50); changed('history'); return { ok: true }; }
+    if (a === 'history') { S.history = [{ id: b, at: Date.now() }, ...S.history.filter((h) => h.id !== b)].slice(0, 50); changed(); return { ok: true }; }
     if (a === 'likes') {
       const i = S.likes.findIndex((x) => x.id === b);
       if (i >= 0) S.likes.splice(i, 1); else S.likes.unshift({ id: b, at: Date.now() });
-      changed('likes'); return { liked: i < 0 };
+      changed(); return { liked: i < 0 };
     }
     if (a === 'playlists') {
-      if (!b && method === 'POST') { const p = { id: newId(), name: body.name || `我的歌单 #${S.playlists.length + 1}`, description: '', items: [], createdAt: Date.now() }; S.playlists.push(p); changed('playlists'); return p; }
+      if (!b && method === 'POST') { const p = { id: newId(), name: body.name || `我的歌单 #${S.playlists.length + 1}`, description: '', items: [], createdAt: Date.now() }; S.playlists.push(p); changed(); return p; }
       const p = S.playlists.find((x) => x.id === b);
-      if (method === 'DELETE') { S.playlists = S.playlists.filter((x) => x.id !== b); changed('playlists'); return { ok: true }; }
+      if (method === 'DELETE') { S.playlists = S.playlists.filter((x) => x.id !== b); changed(); return { ok: true }; }
       if (!p) throw new Error('not found');
-      if (c === 'items') { p.items.push({ id: body.id, at: Date.now() }); changed('playlists'); return p; }
+      if (c === 'items') { p.items.push({ id: body.id, at: Date.now() }); changed(); return p; }
       if (method === 'PATCH') {
         if (typeof body.name === 'string') p.name = body.name.trim() || p.name;
         if (typeof body.description === 'string') p.description = body.description;
         if (Array.isArray(body.items)) p.items = body.items;
-        changed('playlists'); return p;
+        changed(); return p;
       }
     }
     if (a === 'tracks' && method === 'POST') {
       if (body.source !== 'archive' || !String(body.url).startsWith('https://archive.org/')) throw new Error('bad track');
       const id = 'a_' + hash(body.url);
       S.tracks[id] ||= { id, source: 'archive', url: body.url, title: body.title, artist: body.artist || '未知艺人', albumArtist: body.albumArtist || null, album: body.album || 'Internet Archive', year: body.year || null, duration: body.duration || 0, cover: body.cover || null, license: body.license || null, page: body.page || null, trackNo: body.trackNo || null, addedAt: Date.now() };
-      changed('library'); return S.tracks[id];
+      changed(); return S.tracks[id];
     }
-    if (a === 'rescan') { const r = await scan(); return { count: r.total }; }
     if (a === 'archive' && b === 'search') return iaSearch(u.searchParams.get('q') || '');
     if (a === 'archive' && b === 'item') return iaItem(c);
     throw new Error(`unknown route ${method} ${u.pathname}`);
@@ -359,31 +363,33 @@
 
   // ---------- boot ----------
   async function init() {
-    try { const raw = localStorage.getItem(LS_KEY); if (raw) S = hydrate(JSON.parse(raw)); } catch {}
-    try { me = await apiFetch('/api/me'); signedIn = true; } catch (e) { return { signedIn: false, error: e.message }; }
-    if (!me.r2) return { signedIn: true, error: 'r2_not_configured' };
-    return { signedIn: true };
+    try { nas = JSON.parse(localStorage.getItem(NAS_KEY) || 'null'); } catch {}
+    try {
+      const raw = await idbGet('kv', 'state');
+      if (raw) S = hydrate(raw);
+      else {
+        // the old cloud version kept its state in localStorage: keep the free-library songs, likes and playlists
+        const old = JSON.parse(localStorage.getItem('echo.r2.v1') || 'null');
+        if (old) {
+          S = hydrate(old);
+          dropTracks(Object.keys(S.tracks).filter((id) => S.tracks[id].source !== 'archive'));
+          S.playlists = S.playlists.filter((p) => !String(p.source || '').startsWith('r2:'));
+          delete S.at; delete S.updatedAt;
+          await save();
+        }
+      }
+      localStorage.removeItem('echo.r2.v1');
+    } catch (e) { console.warn('load failed', e); }
   }
-  async function login(password) {
-    const r = await fetch('/api/auth/login', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-    if (r.status === 401) throw new Error('wrong_password');
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'login_failed');
-    return init();
-  }
-  async function sync() { if (signedIn) await pull(); }
-  async function user() { return me; }
-  async function logout() {
-    await fetch('/api/auth/logout', { method: 'POST' });
-    signedIn = false; me = null;
-    try { localStorage.removeItem(LS_KEY); } catch {}
-    S = empty();
-  }
-  function setDuration(id, d) { const t = S.tracks[id]; if (t && d && Math.abs((t.duration || 0) - d) > 1) { t.duration = d; changed('library'); } }
+  function setDuration(id, d) { const t = S.tracks[id]; if (t && d && Math.abs((t.duration || 0) - d) > 1) { t.duration = d; changed(); } }
 
   window.Store = {
-    init, login, sync, scan, upload, migrateBlob, api, src, user, logout, setDuration, download,
+    init, api, src, download, setDuration,
+    importFiles, deleteLocal, storageInfo,
+    nasConnect, nasDisconnect, nasSync,
+    get nas() { return nas && { url: nas.url, user: nas.user }; },
     get state() { return S; },
-    get signedIn() { return signedIn; },
     onChange: (f) => listeners.add(f),
+    _md5: md5,
   };
 })();

@@ -12,9 +12,9 @@ const audio = $('#audio');
 
 // ---------- derived catalog ----------
 function catalog() {
-  // archive tracks only count as "yours" once liked or put in a playlist
+  // free-library tracks only count as "yours" once liked or put in a playlist
   const kept = new Set([...S.likes.map((l) => l.id), ...S.playlists.flatMap((p) => p.items.map((i) => i.id))]);
-  const tracks = Object.values(S.tracks).filter((t) => t.source === 'r2' || kept.has(t.id));
+  const tracks = Object.values(S.tracks).filter((t) => t.source !== 'archive' || kept.has(t.id));
   const albums = {}, artists = {};
   for (const t of tracks) {
     const aa = t.albumArtist || t.artist;
@@ -125,7 +125,7 @@ async function loadTrack(id, autoplay, startAt = 0) {
   dropBuf();
   if (!url) {
     renderNowPlaying();
-    try { url = await srcOf(t); } catch (e) { return handleAuthError(e); }
+    try { url = await srcOf(t); } catch (e) { return playError(e); }
     if (seq !== loadSeq) return;
   }
   setAudioSrc(url, startAt);
@@ -148,29 +148,27 @@ function setAudioSrc(url, startAt = 0) {
   }
   if (startAt) audio.addEventListener('loadedmetadata', () => { audio.currentTime = startAt; }, { once: true });
 }
-// signed R2 links expire: on error get a freshly signed one, then fall back to a full download
+// a NAS stream can drop (phone switched network, server restarted): retry once, then download the whole song
 async function recoverPlayback() {
   const t = S.tracks[P.current];
   if (!t) return;
-  const at = audio.currentTime, wasPlaying = !audio.paused || audio.autoplay;
+  const at = audio.currentTime;
   const seq = loadSeq;
   srcRetry++;
   try {
-    if (t.source !== 'r2' || srcRetry > 2) throw new Error('give up');
+    if (t.source !== 'nas' || srcRetry > 2) throw new Error('give up');
     if (srcRetry === 2) toast('正在下载这首歌…');
-    const url = await srcOf(t, srcRetry === 1 ? 'fresh' : 'blob');
-    if (seq !== loadSeq) return;
+    const url = srcRetry === 1 ? await srcOf(t) : await Store.download(t);
+    if (seq !== loadSeq || !url) return;
     setAudioSrc(url, at);
     audio.play().catch(() => {});
-  } catch (e) {
-    if (e.message === 'signed_out') return handleAuthError(e);
+  } catch {
     toast('这首歌无法播放，跳到下一首');
     setTimeout(() => next(true), 800);
   }
 }
-function handleAuthError(e) {
-  if (e?.message === 'signed_out') { toast('登录已过期，请重新登录'); location.hash = '#/login'; }
-  else toast('连接云端失败，请稍后再试');
+function playError(e) {
+  toast({ local_missing: '这首歌的文件不在这台设备上了', nas_disconnected: '还没连接 NAS，去设置里连接' }[e?.message] || '这首歌无法播放');
 }
 function next(auto = false) {
   if (P.repeat === 'one' && auto) { audio.currentTime = 0; audio.play(); return; }
@@ -346,7 +344,7 @@ function renderPanel() {
       <button class="icon-btn like ${isLiked(t.id) ? 'on' : ''}" data-like="${t.id}"><i class="ic ${isLiked(t.id) ? 'ic-heart-on' : 'ic-heart'}"></i></button></div>
     <div class="box"><h4>歌曲信息</h4>
       <div class="muted" style="font-size:14px;line-height:1.8">专辑：<a href="#/album/${enc((t.albumArtist || t.artist) + '\u0000' + t.album)}">${esc(t.album)}</a><br>
-      ${t.year ? `年份：${esc(t.year)}<br>` : ''}${t.genre ? `风格：${esc(t.genre)}<br>` : ''}来源：${t.source === 'r2' ? '云端（Cloudflare R2）' : `<a href="${esc(t.page || t.url)}" target="_blank" style="text-decoration:underline">Internet Archive</a>`}
+      ${t.year ? `年份：${esc(t.year)}<br>` : ''}${t.genre ? `风格：${esc(t.genre)}<br>` : ''}来源：${t.source === 'local' ? '本机文件' : t.source === 'nas' ? 'NAS' : `<a href="${esc(t.page || t.url)}" target="_blank" style="text-decoration:underline">Internet Archive</a>`}
       ${t.license ? `<br><span class="license">授权：<a href="${esc(t.license)}" target="_blank">${esc(licName(t.license))}</a></span>` : ''}</div></div>
     ${nxt ? `<div class="box"><h4 style="display:flex;justify-content:space-between">下一首 <a class="muted" href="#" onclick="setPanel('queue');return false" style="font-size:13px">打开队列</a></h4>${qItem(nxt)}</div>` : ''}`;
 }
@@ -369,7 +367,7 @@ function renderLibrary() {
   if (libFilter === 'all' || libFilter === 'al') for (const a of albums) items.push({ href: `#/album/${enc(a.key)}`, html: art(a.cover, a.title), t: a.title, s: `专辑 · ${a.artist}` });
   if (libFilter === 'all' || libFilter === 'ar') for (const a of artists) items.push({ href: `#/artist/${enc(a.name)}`, html: art(a.cover, a.name, 'art', 'ic-note'), t: a.name, s: '艺人', round: true });
   $('#libList').innerHTML = items.map((i) => `<div class="lib-item ${i.round ? 'round' : ''} ${location.hash === i.href ? 'active' : ''}" data-href="${i.href}">${i.html}<div><div class="t">${esc(i.t)}</div><div class="s">${esc(i.s)}</div></div></div>`).join('')
-    || `<div class="empty" style="padding:24px 8px"><p>音乐库还是空的</p><a class="btn primary" href="#/upload">上传音乐</a></div>`;
+    || `<div class="empty" style="padding:24px 8px"><p>音乐库还是空的</p><a class="btn primary" href="#/import">添加音乐</a></div>`;
   markPlaying();
 }
 
@@ -421,8 +419,7 @@ const routes = [
   [/^#\/artist\/(.+)$/, viewArtist],
   [/^#\/archive(?:\/search\/(.*))?$/, viewArchive],
   [/^#\/ia\/(.+)$/, viewArchiveItem],
-  [/^#\/upload$/, viewUpload],
-  [/^#\/login/, viewLogin],
+  [/^#\/(import|upload)$/, viewImport],
   [/^#\/settings$/, viewSettings],
 ];
 let lastRoute = null;
@@ -455,9 +452,9 @@ function viewHome() {
   const hour = new Date().getHours();
   const greet = hour < 5 ? '夜深了' : hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好';
   if (!tracks.length) {
-    if (!Store.signedIn) return viewLogin();
     view.innerHTML = `<div class="view"><h1 class="page">${greet}</h1><div class="empty"><i class="ic ic-note"></i><h3>你的音乐库还是空的</h3>
-      <p>上传你的音乐到云端，或者去免费曲库找点好听的。</p><a class="btn primary" href="#/upload">上传音乐</a> &nbsp; <a class="btn ghost" href="#/archive">逛逛免费曲库</a></div></div>`;
+      <p>导入手机或电脑里的音乐，连接你的 NAS，或者去免费曲库找点好听的。</p>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"><a class="btn primary" href="#/import">导入本机音乐</a><a class="btn ghost" href="#/settings">连接 NAS</a><a class="btn ghost" href="#/archive">逛逛免费曲库</a></div></div></div>`;
     return;
   }
   const recent = S.history.map((h) => S.tracks[h.id]).filter(Boolean);
@@ -636,104 +633,114 @@ async function viewArchiveItem(id) {
   } catch { view.innerHTML = `<div class="view"><div class="empty"><h3>加载失败</h3><p>连不上 Internet Archive，稍后再试。</p></div></div>`; }
 }
 
-function viewUpload() {
-  if (!Store.signedIn) return viewLogin();
-  const folders = [...new Set(S.playlists.filter((p) => String(p.source || '').startsWith('r2:')).map((p) => p.source.slice(3)))];
-  view.innerHTML = `<div class="view"><h1 class="page">上传音乐</h1>
-    <div class="note" style="margin:0 0 16px"><label for="upFolder"><b style="color:var(--text)">放进文件夹（可选）</b></label><br>
-      每个文件夹会自动变成一个同名歌单。留空就直接放进音乐库。<br>
+const noFolderPicker = /iPhone|iPad|iPod/.test(navigator.userAgent) || !('webkitdirectory' in document.createElement('input'));
+function viewImport() {
+  const folders = [...new Set(S.playlists.filter((p) => String(p.source || '').startsWith('local:')).map((p) => p.source.slice(6)))];
+  view.innerHTML = `<div class="view"><h1 class="page">导入本机音乐</h1>
+    <div class="note" style="margin:0 0 16px"><label for="upFolder"><b style="color:var(--text)">放进歌单（可选）</b></label><br>
+      填了名字，这次导入的歌会放进同名歌单。选整个文件夹导入时，每个文件夹自动变成一个歌单。<br>
       <input id="upFolder" list="upFolders" maxlength="100" placeholder="例如：周末歌单" style="margin-top:10px;width:min(360px,100%);background:#2a2a2a;border:1px solid #3e3e3e;border-radius:6px;padding:10px 12px;color:var(--text)">
       <datalist id="upFolders">${folders.map((f) => `<option value="${esc(f)}">`).join('')}</datalist></div>
     <label class="drop" id="drop"><input type="file" id="fileInput" multiple accept="audio/*,.mp3,.m4a,.flac,.wav,.ogg,.opus" hidden>
-      <i class="ic ic-up"></i><h3>把音乐文件拖到这里</h3><p>或者点击选择文件。会上传到你的云端（Cloudflare R2）。</p>
+      <i class="ic ic-up"></i><h3>${touchUI.matches ? '点这里选择音乐文件' : '把音乐文件拖到这里'}</h3><p>${touchUI.matches ? '可以一次选多首' : '或者点击选择文件'}。歌会保存在这台设备上，不会上传到任何地方。</p>
       <div class="progress hidden" id="prog"><div></div></div><p id="upMsg"></p></label>
-    <div class="note">支持 MP3、M4A、FLAC、WAV、OGG。歌名、歌手、专辑、封面从文件标签读取；没有标签的话，用文件名 <code>歌手 - 歌名.mp3</code>，文件夹名当作专辑名。<br>
-    在 Cloudflare 网页上直接往 <code>music/</code> 里放了歌之后，点 <a href="#" id="rescan" style="text-decoration:underline">重新扫描云端</a>。</div></div>`;
+    ${noFolderPicker ? '' : `<div style="margin-top:12px"><label class="btn ghost" style="cursor:pointer"><input type="file" id="dirInput" webkitdirectory multiple hidden><i class="ic ic-folder"></i>导入整个文件夹</label></div>`}
+    <div class="note">支持 MP3、M4A、FLAC、WAV、OGG。歌名、歌手、专辑、封面从文件标签读取；没有标签的话，用文件名 <code>歌手 - 歌名.mp3</code>。<br>
+    iPhone：「文件」App 里的歌都能选，包括 iCloud 云盘里的。<br>
+    歌存在这个浏览器的存储里：换手机或清除浏览器数据后要重新导入。歌很多的话，建议放在 NAS 上，在<a href="#/settings" style="text-decoration:underline">设置</a>里连接。</div></div>`;
   const drop = $('#drop'), input = $('#fileInput');
-  input.onchange = () => uploadFiles([...input.files]);
+  input.onchange = () => importFiles([...input.files]);
+  if ($('#dirInput')) $('#dirInput').onchange = (e) => importFiles([...e.target.files], true);
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
-  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); uploadFiles([...e.dataTransfer.files]); };
-  $('#rescan').onclick = (e) => { e.preventDefault(); runScan(); };
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); importFiles([...e.dataTransfer.files]); };
 }
-async function uploadFiles(files) {
-  files = files.filter((f) => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|flac|wav|ogg|opus)$/i.test(f.name));
-  if (!files.length) return toast('没有可以上传的音乐文件');
+async function importFiles(files, fromDir = false) {
   const prog = $('#prog');
   prog.classList.remove('hidden');
-  $('#upMsg').textContent = `正在上传 ${files.length} 个文件到云端…`;
+  $('#upMsg').textContent = '正在读取歌曲信息…';
   try {
-    const r = await Store.upload(files, (f) => { $('div', prog).style.width = `${f * 100}%`; }, $('#upFolder')?.value || '');
-    $('#upMsg').textContent = `完成：上传了 ${r.uploaded} 首`;
-    toast(`已添加 ${r.uploaded} 首歌`);
-  } catch (e) {
-    $('#upMsg').textContent = '上传失败：' + (e.message === 'upload 0' || e.message === 'network' ? '连不上云端存储（请检查 R2 的 CORS 设置）' : e.message);
-    handleAuthError(e);
-  }
-}
-async function runScan(quiet = false) {
-  if (!Store.signedIn) return;
-  try {
-    const r = await Store.scan((p) => {
-      if (quiet) return;
-      toast(p.phase === 'list' ? `正在查找云端的音乐… ${p.found || ''}` : `正在读取歌曲信息 ${p.done}/${p.total}`);
+    const r = await Store.importFiles(files, {
+      folder: fromDir ? '' : $('#upFolder')?.value || '',
+      onProgress: (done, total) => { $('div', prog).style.width = `${(done / total) * 100}%`; $('#upMsg').textContent = `正在导入 ${done}/${total}…`; },
     });
-    if (!quiet || r.added || r.removed) toast(`云端共 ${r.total} 首歌${r.added ? `，更新 ${r.added} 首` : ''}`);
+    if (!r.added && !r.skipped) { $('#upMsg').textContent = ''; prog.classList.add('hidden'); return toast('没有可以导入的音乐文件'); }
+    $('#upMsg').textContent = `完成：导入了 ${r.added} 首${r.skipped ? `，${r.skipped} 首已经在音乐库里` : ''}`;
+    toast(`已添加 ${r.added} 首歌`);
   } catch (e) {
-    if (e.message === 'signed_out') return handleAuthError(e);
-    toast(e.message === 'r2_not_configured' ? '服务器还没配置 R2' : '读取云端音乐失败，请稍后再试');
+    console.error(e);
+    $('#upMsg').textContent = e?.name === 'QuotaExceededError' ? '设备存储空间不够了，删掉一些歌再试' : '导入失败：' + (e?.message || e);
   }
 }
 
-function viewLogin() {
-  view.innerHTML = `<div class="view"><form class="empty" id="loginForm" style="padding-top:12vh;max-width:360px;margin:0 auto">
-    <div class="logo" style="width:72px;height:72px;margin:0 auto"></div>
-    <h3 style="font-size:30px">Echo</h3>
-    <p>输入密码，播放你放在云端的音乐。<br>歌单和收藏会同步到你所有的设备。</p>
-    <input type="password" id="pw" autocomplete="current-password" placeholder="密码" required
-      style="width:100%;margin-top:16px;background:#2a2a2a;border:1px solid #3e3e3e;border-radius:6px;padding:12px 14px;color:var(--text);font-size:16px">
-    <p id="loginErr" style="color:#f28b82;min-height:1.4em;margin:10px 0 0"></p>
-    <button class="btn primary" id="loginBtn" style="font-size:16px;padding:12px 28px;margin-top:8px">登录</button>
-    <p style="margin-top:28px;font-size:13px">不登录也可以先<a href="#/archive" style="text-decoration:underline">逛逛免费曲库</a>。</p></form></div>`;
-  const form = $('#loginForm'), btn = $('#loginBtn');
-  setTimeout(() => $('#pw')?.focus(), 0);
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    btn.disabled = true; $('#loginErr').textContent = '';
-    try {
-      const { error } = await Store.login($('#pw').value);
-      S = Store.state;
-      if (error === 'r2_not_configured') toast('服务器还没配置 R2 云端存储');
-      location.hash = '#/';
-      await route();
-      await Store.sync().catch(() => {});
-      S = Store.state;
-      runScan(Object.keys(S.tracks).length > 0);
-    } catch (err) {
-      $('#loginErr').textContent = err.message === 'wrong_password' ? '密码不对，再试一次。' : err.message === 'not_configured' ? '服务器还没设置密码（APP_PASSWORD）。' : '登录失败，请检查网络。';
-      btn.disabled = false;
-    }
-  };
+const NAS_ERRORS = {
+  nas_needs_https: 'NAS 地址必须是 https:// 开头（浏览器不允许 https 网页连接 http 地址）。可以用群晖 DDNS + 证书、Tailscale，或者反向代理。',
+  nas_unreachable: '连不上这个地址。检查地址和端口，确认 NAS 开着，并且服务器允许跨域（CORS）。',
+  nas_not_subsonic: '这个地址不是 Subsonic 服务器。请填 Navidrome 等服务的网址，例如 https://music.example.com',
+  nas_wrong_login: '用户名或密码不对。',
+  nas_token_unsupported: '这个服务器不支持令牌登录（常见于 LDAP 账号），请换一个本地账号。',
+};
+const nasError = (e) => NAS_ERRORS[e?.message] || (String(e?.message || e).startsWith('nas_http_') ? `服务器返回错误 ${e.message.slice(9)}` : `出错了：${e?.message || e}`);
+async function runNasSync(quiet = false) {
+  if (!Store.nas) return;
+  try {
+    const r = await Store.nasSync((p) => { if (!quiet) toast(p.phase === 'songs' ? `正在读取 NAS 的歌… ${p.count}` : `正在读取 NAS 歌单 ${p.done}/${p.total}`); });
+    if (!quiet && r) toast(`NAS：${r.songs} 首歌，${r.playlists} 个歌单`);
+  } catch (e) { if (!quiet) toast(nasError(e)); else console.warn('nas sync failed', e); }
 }
 
 async function viewSettings() {
-  if (!Store.signedIn) return viewLogin();
-  const u = await Store.user();
-  const r2Count = Object.values(S.tracks).filter((t) => t.source === 'r2').length;
+  const info = await Store.storageInfo();
+  const mb = (b) => `${(b / 1024 / 1024).toFixed(b > 100 * 1024 * 1024 ? 0 : 1)} MB`;
+  const nasCount = Object.values(S.tracks).filter((t) => t.source === 'nas').length;
+  const field = 'width:100%;background:#2a2a2a;border:1px solid #3e3e3e;border-radius:6px;padding:10px 12px;color:var(--text);margin-top:8px;font-size:16px';
   view.innerHTML = `<div class="view"><h1 class="page">设置</h1>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:20px">
-      <a class="btn primary" href="#/upload">上传音乐</a>
-      <button class="btn ghost" id="scanBtn">重新扫描云端</button>
-      ${u?.blob ? '<button class="btn ghost" id="migrateBtn">从 Vercel Blob 搬歌到 R2</button>' : ''}
-      ${installPrompt ? '<button class="btn primary" id="installBtn">安装到手机桌面</button>' : ''}
-      ${canFullscreen ? `<button class="btn ghost" id="fsBtn">${document.fullscreenElement ? '退出全屏' : '全屏显示'}</button>` : ''}
-      <button class="btn ghost" id="logoutBtn">退出登录</button></div>
-    <p id="migrateMsg" class="muted" style="margin-top:12px"></p>
-    <div class="note">云端（Cloudflare R2）里有 ${r2Count} 首歌，${S.playlists.length} 个歌单，${likedTracks().length} 首收藏。<br>
-    歌单、收藏和播放记录也保存在云端，换手机或电脑用同一个密码登录就能看到。<br>
-    云端 <code>music/</code> 下的每个文件夹会自动变成一个同名歌单。</div>
-    <div class="note"><b>装到手机桌面</b><br>iPhone：用 Safari 打开这个网址 → 点底部的「分享」→「添加到主屏幕」。<br>Android：Chrome 菜单 →「安装应用」。<br>从主屏幕打开时没有浏览器地址栏，画面会铺满整个屏幕，横屏竖屏都会自动适配。<br><span style="font-size:12px;opacity:.7">${esc(screenInfo())}</span></div></div>`;
-  $('#scanBtn').onclick = () => runScan();
+    <h2 class="sec">本机音乐</h2>
+    <div class="note" style="margin-top:0">这台设备上有 ${info.count} 首歌，占用 ${mb(info.used)}${info.quota ? `（浏览器最多可用约 ${mb(info.quota)}）` : ''}。${info.persisted ? '' : '<br>提示：把 Echo 装到手机桌面后，存储更稳定，系统不会自动清理。'}
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px"><a class="btn primary" href="#/import">导入音乐</a>${info.count ? '<button class="btn ghost" id="clearLocal">删除本机所有歌</button>' : ''}</div></div>
+
+    <h2 class="sec">NAS（Subsonic / Navidrome）</h2>
+    ${Store.nas ? `<div class="note" style="margin-top:0">已连接 <b style="color:var(--text)">${esc(Store.nas.url)}</b>（${esc(Store.nas.user)}），${nasCount} 首歌。
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px"><button class="btn primary" id="nasSync">立即同步</button><button class="btn ghost" id="nasOff">断开连接</button></div></div>`
+    : `<form class="note" id="nasForm" style="margin-top:0;max-width:520px">
+      在 NAS 上装 <a href="https://www.navidrome.org/docs/installation/" target="_blank" style="text-decoration:underline">Navidrome</a>（群晖、威联通、Unraid 都能用 Docker 装），或者其他兼容 Subsonic 的服务。连上后会读取 NAS 上所有的歌和歌单，边下边播。
+      <input name="url" required placeholder="服务器地址，例如 https://music.example.com" inputmode="url" autocomplete="url" autocapitalize="off" style="${field};margin-top:14px">
+      <input name="user" required placeholder="用户名" autocomplete="username" autocapitalize="off" style="${field}">
+      <input name="password" type="password" required placeholder="密码" autocomplete="current-password" style="${field}">
+      <p id="nasMsg" style="color:#f28b82;min-height:1.2em;margin:10px 0 0"></p>
+      <button class="btn primary" id="nasBtn" style="margin-top:4px">连接</button>
+      <p style="font-size:13px;margin:12px 0 0">密码不会被保存，只保存一个登录令牌，而且只存在这台设备上。地址必须是 https://（http 只能在本机测试时用）。</p></form>`}
+
+    <h2 class="sec">装到手机桌面</h2>
+    <div class="note" style="margin-top:0">iPhone：用 Safari 打开这个网址 → 点底部的「分享」→「添加到主屏幕」。<br>Android：点下面的按钮，或 Chrome 菜单 →「安装应用」。<br>从主屏幕打开时没有浏览器地址栏，画面会铺满整个屏幕。
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">${installPrompt ? '<button class="btn primary" id="installBtn">安装到手机桌面</button>' : ''}${canFullscreen ? `<button class="btn ghost" id="fsBtn">${document.fullscreenElement ? '退出全屏' : '全屏显示'}</button>` : ''}</div>
+      <span style="font-size:12px;opacity:.7">${esc(screenInfo())}</span></div></div>`;
+  if ($('#nasForm')) $('#nasForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target), btn = $('#nasBtn');
+    btn.disabled = true; btn.textContent = '正在连接…'; $('#nasMsg').textContent = '';
+    try {
+      const r = await Store.nasConnect({ url: fd.get('url'), user: fd.get('user'), password: fd.get('password') });
+      S = Store.state;
+      toast(`已连接：${r.songs} 首歌，${r.playlists} 个歌单`);
+      viewSettings();
+    } catch (err) {
+      $('#nasMsg').textContent = nasError(err);
+      btn.disabled = false; btn.textContent = '连接';
+    }
+  };
+  if ($('#nasSync')) $('#nasSync').onclick = async () => { await runNasSync(); viewSettings(); };
+  if ($('#nasOff')) $('#nasOff').onclick = () => {
+    if (!confirm('断开 NAS？NAS 上的歌和歌单会从这台设备的音乐库里移除（NAS 上的文件不受影响）。')) return;
+    if (S.tracks[P.current]?.source === 'nas') { audio.pause(); audio.removeAttribute('src'); P.current = null; renderNowPlaying(); }
+    Store.nasDisconnect(); S = Store.state; viewSettings();
+  };
+  if ($('#clearLocal')) $('#clearLocal').onclick = async () => {
+    if (!confirm(`删除这台设备上的全部 ${info.count} 首歌？原来的音乐文件不受影响，之后可以重新导入。`)) return;
+    const ids = Object.values(S.tracks).filter((t) => t.source === 'local').map((t) => t.id);
+    if (ids.includes(P.current)) { audio.pause(); audio.removeAttribute('src'); P.current = null; renderNowPlaying(); }
+    await Store.deleteLocal(ids); S = Store.state; toast('已删除'); viewSettings();
+  };
   if ($('#installBtn')) $('#installBtn').onclick = async () => {
     installPrompt.prompt();
     const { outcome } = await installPrompt.userChoice;
@@ -741,20 +748,6 @@ async function viewSettings() {
     if (outcome === 'accepted') { $('#installBtn')?.remove(); toast('已安装，可以从桌面打开了'); }
   };
   if ($('#fsBtn')) $('#fsBtn').onclick = () => { toggleFullscreen(); setTimeout(() => { if ($('#fsBtn')) $('#fsBtn').textContent = document.fullscreenElement ? '退出全屏' : '全屏显示'; }, 300); };
-  if ($('#migrateBtn')) $('#migrateBtn').onclick = async () => {
-    const btn = $('#migrateBtn'), msg = $('#migrateMsg');
-    btn.disabled = true;
-    msg.textContent = '正在把 Blob 里的歌复制到 R2…（Blob 里的文件不会被删除）';
-    try {
-      const r = await Store.migrateBlob((p) => { msg.textContent = `已复制 ${p.copied} 首，还剩 ${p.remaining} 首…`; });
-      msg.textContent = r.noBlob ? '没有找到 Vercel Blob 存储。'
-        : `完成：Blob 里共 ${r.total} 首，这次复制了 ${r.copied} 首。${r.failed.length ? `有 ${r.failed.length} 首复制失败，可以再点一次重试。` : ''}`;
-    } catch (e) {
-      msg.textContent = '搬歌失败：' + e.message;
-      handleAuthError(e);
-    } finally { btn.disabled = false; }
-  };
-  $('#logoutBtn').onclick = async () => { if (!confirm('退出登录？这台设备上的音乐库缓存会被清除（云端的歌和歌单不受影响）。')) return; audio.pause(); audio.removeAttribute('src'); P.current = null; try { localStorage.removeItem('echo.player'); } catch {} await Store.logout(); S = Store.state; renderNowPlaying(); location.hash = '#/login'; };
 }
 
 const notFound = () => `<div class="view"><div class="empty"><h3>找不到这个页面</h3><p>它可能已经被删除了。</p><a class="btn primary" href="#/">回首页</a></div></div>`;
@@ -783,6 +776,7 @@ function trackMenu(id, x, y, plId) {
     <button data-m="newpl">+ 新建歌单</button>
     ${S.playlists.map((p) => `<button data-m="add" data-pl="${p.id}">${esc(p.name)}</button>`).join('')}
     ${plId ? `<hr><button data-m="rmpl">从这个歌单移除</button>` : ''}
+    ${t.source === 'local' ? '<hr><button data-m="dellocal">从这台设备删除</button>' : ''}
     <hr><a href="#/artist/${enc(t.artist)}">前往艺人</a><a href="#/album/${enc((t.albumArtist || t.artist) + '\u0000' + t.album)}">前往专辑</a>
 `);
   menu.onclick = async (e) => {
@@ -795,6 +789,10 @@ function trackMenu(id, x, y, plId) {
     if (m === 'like') toggleLike(id);
     if (m === 'add') addToPlaylist(b.dataset.pl, id);
     if (m === 'newpl') { const p = await api('/api/playlists', { method: 'POST', body: {} }); await addToPlaylist(p.id, id); renderLibrary(); }
+    if (m === 'dellocal' && confirm(`从这台设备删除“${t.title}”？它也会从所有歌单里移除。`)) {
+      if (P.current === id) { audio.pause(); audio.removeAttribute('src'); P.current = null; renderNowPlaying(); }
+      await Store.deleteLocal([id]); S = Store.state; toast('已删除'); route();
+    }
     if (m === 'rmpl') {
       const p = S.playlists.find((x) => x.id === plId);
       const idx = p.items.findIndex((i) => i.id === id);
@@ -1014,19 +1012,14 @@ Store.onChange((state) => {
   S = state;
   clearTimeout(rerenderTimer);
   // don't wipe what the user is typing or a half-filled form
-  rerenderTimer = setTimeout(() => { renderLibrary(); renderNowPlaying(); if (!document.activeElement?.closest('input,textarea') && !/^#\/(upload|settings)/.test(location.hash)) route(); }, 300);
+  rerenderTimer = setTimeout(() => { renderLibrary(); renderNowPlaying(); if (!document.activeElement?.closest('input,textarea') && !/^#\/(import|upload|settings)/.test(location.hash)) route(); }, 300);
 });
 (async () => {
-  const { signedIn, error } = await Store.init();
+  await Store.init();
   S = Store.state;
   restorePlayer();
   setPanel(panelMode || null);
   renderNowPlaying();
-  if (error && error !== 'signed_out') toast({ not_configured: '服务器还没设置密码（APP_PASSWORD）', r2_not_configured: '服务器还没配置 R2 云端存储' }[error] || '连接服务器失败，请检查网络');
   await route();
-  if (signedIn) {
-    await Store.sync().catch(() => {});
-    S = Store.state;
-    runScan(Object.keys(S.tracks).length > 0); // first time: show progress
-  }
+  runNasSync(true); // pick up new songs and playlists on the NAS quietly
 })();

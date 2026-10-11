@@ -1,16 +1,9 @@
 {
   "name": "echo",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "type": "module",
+  "description": "Echo: an open-source music player PWA. Local files + NAS (Subsonic/Navidrome), no server needed.",
   "scripts": {
-    "dev": "vercel dev"
-  },
-  "engines": {
-    "node": "24.x"
-  },
-  "dependencies": {
-    "@vercel/blob": "^2.8.1",
-    "aws4fetch": "^1.0.20"
+    "dev": "npx --yes serve public -l 4321"
   }
 }
