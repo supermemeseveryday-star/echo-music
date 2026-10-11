@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Echo</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Echo">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='%23f2a93b'/><path d='M9 12h14M9 16h10M9 20h14' stroke='%23131313' stroke-width='3' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <nav class="card nav">
+      <a href="#/" class="brand"><span class="logo"></span>Echo</a>
+      <a href="#/" data-nav="home"><i class="ic ic-home"></i>首页</a>
+      <a href="#/search" data-nav="search"><i class="ic ic-search"></i>搜索</a>
+      <a href="#/archive" data-nav="archive"><i class="ic ic-globe"></i>免费曲库</a>
+    </nav>
+    <section class="card library">
+      <header class="lib-head">
+        <a href="#/library" class="lib-title"><i class="ic ic-lib"></i>音乐库</a>
+        <button class="icon-btn" id="newPlaylist" title="新建歌单"><i class="ic ic-plus"></i></button>
+      </header>
+      <div class="chips" id="libChips"></div>
+      <div class="lib-list" id="libList"></div>
+    </section>
+  </aside>
+
+  <main class="card main" id="main">
+    <div class="topbar" id="topbar">
+      <button class="icon-btn round back" onclick="history.back()" title="后退"><i class="ic ic-left"></i></button>
+      <button class="icon-btn round" onclick="history.forward()" title="前进"><i class="ic ic-right"></i></button>
+      <div class="search-box hidden" id="searchBox">
+        <i class="ic ic-search"></i>
+        <input id="searchInput" placeholder="想听什么？" autocomplete="off">
+      </div>
+      <span class="grow"></span>
+      <a class="btn ghost" id="upBtn" href="#/upload"><i class="ic ic-up"></i>上传音乐</a>
+      <a class="icon-btn round" href="#/settings" title="设置" style="display:inline-grid"><i class="ic ic-gear"></i></a>
+    </div>
+    <div id="view"></div>
+  </main>
+
+  <aside class="card panel" id="panel"></aside>
+
+  <footer class="player idle">
+    <div class="mini-progress"><div id="miniProg"></div></div>
+    <div class="np" id="np"></div>
+    <div class="controls">
+      <div class="buttons">
+        <button class="icon-btn" id="shuffleBtn" title="随机播放"><i class="ic ic-shuffle"></i></button>
+        <button class="icon-btn" id="prevBtn" title="上一首"><i class="ic ic-prev"></i></button>
+        <button class="play-btn" id="playBtn" title="播放"><i class="ic ic-play"></i></button>
+        <button class="icon-btn" id="nextBtn" title="下一首"><i class="ic ic-next"></i></button>
+        <button class="icon-btn" id="repeatBtn" title="循环"><i class="ic ic-repeat"></i></button>
+      </div>
+      <div class="seek">
+        <span id="tCur">0:00</span>
+        <input type="range" id="seek" min="0" max="1000" value="0" class="slider">
+        <span id="tDur">0:00</span>
+      </div>
+    </div>
+    <div class="extras">
+      <button class="icon-btn" id="queueBtn" title="播放队列"><i class="ic ic-queue"></i></button>
+      <button class="icon-btn" id="muteBtn" title="静音"><i class="ic ic-vol"></i></button>
+      <input type="range" id="volume" min="0" max="100" value="80" class="slider vol">
+    </div>
+  </footer>
+
+  <nav class="tabbar">
+    <a href="#/" data-nav="home"><i class="ic ic-home"></i>首页</a>
+    <a href="#/search" data-nav="search"><i class="ic ic-search"></i>搜索</a>
+    <a href="#/library" data-nav="library"><i class="ic ic-lib"></i>音乐库</a>
+    <a href="#/archive" data-nav="archive"><i class="ic ic-globe"></i>曲库</a>
+  </nav>
+</div>
+<div id="menu" class="menu hidden"></div>
+<div id="toast" class="toast"></div>
+<audio id="audio" preload="auto"></audio>
+<script src="/id3.js"></script>
+<script src="/store.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
